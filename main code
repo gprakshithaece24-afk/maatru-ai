@@ -1,0 +1,657 @@
+import Int "mo:core/Int";
+import Text "mo:core/Text";
+import List "mo:core/List";
+import Array "mo:core/Array";
+import Map "mo:core/Map";
+import Runtime "mo:core/Runtime";
+import Iter "mo:core/Iter";
+import Order "mo:core/Order";
+import Principal "mo:core/Principal";
+import MixinAuthorization "authorization/MixinAuthorization";
+import AccessControl "authorization/access-control";
+import Time "mo:core/Time";
+
+actor {
+  public type UserRole = {
+    #pregnantWoman;
+    #ashaWorker;
+    #admin;
+  };
+
+  public type Language = {
+    #hindi;
+    #marathi;
+    #gujarati;
+  };
+
+  public type RiskStatus = {
+    #green;
+    #yellow;
+    #red;
+  };
+
+  public type UserProfile = {
+    id : Text;
+    name : Text;
+    role : UserRole;
+    language : Language;
+    phone : Text;
+    village : Text;
+    weeksPregnant : ?Nat;
+    dueDate : ?Time.Time;
+    assignedAshaId : ?Text;
+    riskStatus : RiskStatus;
+    beneficiaries : [Text];
+    zone : ?Text;
+    lastCheckIn : ?Time.Time;
+  };
+
+  public type HealthLog = {
+    userId : Text;
+    date : Time.Time;
+    symptoms : [Text];
+    mood : Text;
+    nutritionNotes : Text;
+    concerns : Text;
+  };
+
+  public type SOSAlert = {
+    id : Nat;
+    userId : Text;
+    timestamp : Time.Time;
+    note : Text;
+    status : {
+      #active;
+      #resolved;
+    };
+  };
+
+  public type Notification = {
+    id : Nat;
+    userId : Text;
+    message : Text;
+    isRead : Bool;
+    timestamp : Time.Time;
+    alertType : {
+      #missedCheckIn;
+      #riskStatusChange;
+      #sosEvent;
+    };
+  };
+
+  public type NutritionTip = {
+    text : Text;
+    audioLabel : Text;
+  };
+
+  module HealthLog {
+    public func compareByDate(log1 : HealthLog, log2 : HealthLog) : Order.Order {
+      Int.compare(log1.date, log2.date);
+    };
+  };
+
+  module Notification {
+    public func compareByTimestamp(notification1 : Notification, notification2 : Notification) : Order.Order {
+      Int.compare(notification1.timestamp, notification2.timestamp);
+    };
+  };
+
+  let userProfiles = Map.empty<Text, UserProfile>();
+  let healthLogs = Map.empty<Text, List.List<HealthLog>>();
+  let sosAlerts = Map.empty<Nat, SOSAlert>();
+  let notifications = Map.empty<Nat, Notification>();
+  let nutritionTips = List.empty<NutritionTip>();
+  var nextAlertId = 0;
+  var nextNotificationId = 0;
+
+  // Map Principal to userId for authorization
+  let principalToUserId = Map.empty<Principal, Text>();
+
+  // Authorization
+  let accessControlState = AccessControl.initState();
+  include MixinAuthorization(accessControlState);
+
+  // Helper function to get userId from caller Principal
+  func getCallerUserId(caller : Principal) : ?Text {
+    principalToUserId.get(caller);
+  };
+
+  // Helper function to check if ASHA worker is assigned to beneficiary
+  func isAshaAssignedToBeneficiary(ashaId : Text, beneficiaryId : Text) : Bool {
+    switch (userProfiles.get(ashaId)) {
+      case (null) { false };
+      case (?ashaProfile) {
+        ashaProfile.beneficiaries.find(func(b) { b == beneficiaryId }) != null;
+      };
+    };
+  };
+
+  // --- User Profile Management ---
+  public shared ({ caller }) func createUserProfile(profile : UserProfile) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can create profiles");
+    };
+
+    // Only admins can create ASHA workers or admins
+    if ((profile.role == #ashaWorker or profile.role == #admin) and not AccessControl.isAdmin(accessControlState, caller)) {
+      Runtime.trap("Unauthorized: Only admins can create ASHA workers or admins");
+    };
+
+    if (userProfiles.containsKey(profile.id)) {
+      Runtime.trap("User profile already exists");
+    };
+
+    userProfiles.add(profile.id, profile);
+    principalToUserId.add(caller, profile.id);
+  };
+
+  public query ({ caller }) func getCallerUserProfile() : async ?UserProfile {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only users can access profiles");
+    };
+
+    switch (getCallerUserId(caller)) {
+      case (null) { null };
+      case (?userId) { userProfiles.get(userId) };
+    };
+  };
+
+  public shared ({ caller }) func saveCallerUserProfile(profile : UserProfile) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only users can save profiles");
+    };
+
+    switch (getCallerUserId(caller)) {
+      case (null) { Runtime.trap("Unauthorized: User profile not found for caller") };
+      case (?userId) {
+        if (userId != profile.id) {
+          Runtime.trap("Unauthorized: Cannot modify another user's profile");
+        };
+
+        // Verify role changes are admin-only
+        switch (userProfiles.get(userId)) {
+          case (?existingProfile) {
+            if (existingProfile.role != profile.role and not AccessControl.isAdmin(accessControlState, caller)) {
+              Runtime.trap("Unauthorized: Only admins can change user roles");
+            };
+          };
+          case (null) {};
+        };
+
+        userProfiles.add(userId, profile);
+      };
+    };
+  };
+
+  public query ({ caller }) func getUserProfile(userId : Text) : async ?UserProfile {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only users can access profiles");
+    };
+
+    // Users can view their own profile, admins can view any profile
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot view other user profiles");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != userId and not AccessControl.isAdmin(accessControlState, caller)) {
+          // ASHA workers can view their assigned beneficiaries
+          switch (userProfiles.get(callerUserId)) {
+            case (?callerProfile) {
+              if (callerProfile.role != #ashaWorker or not isAshaAssignedToBeneficiary(callerUserId, userId)) {
+                Runtime.trap("Unauthorized: Cannot view other user profiles");
+              };
+            };
+            case (null) {
+              Runtime.trap("Unauthorized: Cannot view other user profiles");
+            };
+          };
+        };
+      };
+    };
+
+    userProfiles.get(userId);
+  };
+
+  public shared ({ caller }) func updateUserProfile(id : Text, updatedProfile : UserProfile) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can update profiles");
+    };
+
+    // Only admins or the user themselves can update profiles
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot update other user profiles");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != id and not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot update other user profiles");
+        };
+      };
+    };
+
+    // Role changes require admin
+    if ((updatedProfile.role == #ashaWorker or updatedProfile.role == #admin) and not AccessControl.isAdmin(accessControlState, caller)) {
+      Runtime.trap("Unauthorized: Only admins can set ASHA worker or admin roles");
+    };
+
+    switch (userProfiles.get(id)) {
+      case (null) { Runtime.trap("User profile not found") };
+      case (?existingProfile) {
+        if (existingProfile.role != updatedProfile.role and not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Only admins can change user roles");
+        };
+        userProfiles.add(id, updatedProfile);
+      };
+    };
+  };
+
+  // --- Health Log Management ---
+  public shared ({ caller }) func submitHealthLog(log : HealthLog) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can submit health logs");
+    };
+
+    // Users can only submit logs for themselves
+    switch (getCallerUserId(caller)) {
+      case (null) { Runtime.trap("Unauthorized: User profile not found") };
+      case (?callerUserId) {
+        if (callerUserId != log.userId) {
+          Runtime.trap("Unauthorized: Can only submit health logs for yourself");
+        };
+
+        // Verify user is a pregnant woman
+        switch (userProfiles.get(callerUserId)) {
+          case (?profile) {
+            if (profile.role != #pregnantWoman) {
+              Runtime.trap("Unauthorized: Only pregnant women can submit health logs");
+            };
+          };
+          case (null) { Runtime.trap("User profile not found") };
+        };
+      };
+    };
+
+    let userLogs = switch (healthLogs.get(log.userId)) {
+      case (null) { List.empty<HealthLog>() };
+      case (?logs) { logs };
+    };
+
+    userLogs.add(log);
+    healthLogs.add(log.userId, userLogs);
+  };
+
+  public query ({ caller }) func getHealthLogsForUser(userId : Text) : async [HealthLog] {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can view health logs");
+    };
+
+    // Users can view their own logs, ASHA workers can view assigned beneficiaries, admins can view all
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot view other user's health logs");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != userId and not AccessControl.isAdmin(accessControlState, caller)) {
+          // Check if caller is ASHA worker assigned to this beneficiary
+          switch (userProfiles.get(callerUserId)) {
+            case (?callerProfile) {
+              if (callerProfile.role != #ashaWorker or not isAshaAssignedToBeneficiary(callerUserId, userId)) {
+                Runtime.trap("Unauthorized: Cannot view other user's health logs");
+              };
+            };
+            case (null) {
+              Runtime.trap("Unauthorized: Cannot view other user's health logs");
+            };
+          };
+        };
+      };
+    };
+
+    switch (healthLogs.get(userId)) {
+      case (null) { [] };
+      case (?logs) { logs.toArray().sort(HealthLog.compareByDate) };
+    };
+  };
+
+  // --- Risk Status Management ---
+  public shared ({ caller }) func updateRiskStatus(userId : Text, newStatus : RiskStatus) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can update risk status");
+    };
+
+    // Only ASHA workers can update risk status for their assigned beneficiaries, or admins
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot update risk status");
+        };
+      };
+      case (?callerUserId) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          switch (userProfiles.get(callerUserId)) {
+            case (?callerProfile) {
+              if (callerProfile.role != #ashaWorker) {
+                Runtime.trap("Unauthorized: Only ASHA workers can update risk status");
+              };
+              if (not isAshaAssignedToBeneficiary(callerUserId, userId)) {
+                Runtime.trap("Unauthorized: Can only update risk status for assigned beneficiaries");
+              };
+            };
+            case (null) {
+              Runtime.trap("Unauthorized: User profile not found");
+            };
+          };
+        };
+      };
+    };
+
+    switch (userProfiles.get(userId)) {
+      case (null) { Runtime.trap("User profile not found") };
+      case (?profile) {
+        let updatedProfile = { profile with riskStatus = newStatus };
+        userProfiles.add(userId, updatedProfile);
+      };
+    };
+  };
+
+  public query ({ caller }) func getRiskStatus(userId : Text) : async RiskStatus {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can view risk status");
+    };
+
+    // Users can view their own status, ASHA workers can view assigned beneficiaries, admins can view all
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot view risk status");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != userId and not AccessControl.isAdmin(accessControlState, caller)) {
+          switch (userProfiles.get(callerUserId)) {
+            case (?callerProfile) {
+              if (callerProfile.role != #ashaWorker or not isAshaAssignedToBeneficiary(callerUserId, userId)) {
+                Runtime.trap("Unauthorized: Cannot view risk status");
+              };
+            };
+            case (null) {
+              Runtime.trap("Unauthorized: Cannot view risk status");
+            };
+          };
+        };
+      };
+    };
+
+    switch (userProfiles.get(userId)) {
+      case (null) { Runtime.trap("User profile not found") };
+      case (?profile) { profile.riskStatus };
+    };
+  };
+
+  // --- SOS Alerts ---
+  public shared ({ caller }) func triggerSOSAlert(userId : Text, note : Text) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can trigger SOS alerts");
+    };
+
+    // Users can only trigger SOS for themselves
+    switch (getCallerUserId(caller)) {
+      case (null) { Runtime.trap("Unauthorized: User profile not found") };
+      case (?callerUserId) {
+        if (callerUserId != userId) {
+          Runtime.trap("Unauthorized: Can only trigger SOS for yourself");
+        };
+
+        // Verify user is a pregnant woman
+        switch (userProfiles.get(callerUserId)) {
+          case (?profile) {
+            if (profile.role != #pregnantWoman) {
+              Runtime.trap("Unauthorized: Only pregnant women can trigger SOS alerts");
+            };
+          };
+          case (null) { Runtime.trap("User profile not found") };
+        };
+      };
+    };
+
+    let alert : SOSAlert = {
+      id = nextAlertId;
+      userId;
+      timestamp = Time.now();
+      note;
+      status = #active;
+    };
+
+    sosAlerts.add(nextAlertId, alert);
+    nextAlertId += 1;
+  };
+
+  public shared ({ caller }) func resolveSOSAlert(alertId : Nat) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can resolve SOS alerts");
+    };
+
+    switch (sosAlerts.get(alertId)) {
+      case (null) { Runtime.trap("SOS alert not found") };
+      case (?alert) {
+        // Only ASHA workers assigned to the beneficiary or admins can resolve
+        switch (getCallerUserId(caller)) {
+          case (null) {
+            if (not AccessControl.isAdmin(accessControlState, caller)) {
+              Runtime.trap("Unauthorized: Cannot resolve SOS alert");
+            };
+          };
+          case (?callerUserId) {
+            if (not AccessControl.isAdmin(accessControlState, caller)) {
+              switch (userProfiles.get(callerUserId)) {
+                case (?callerProfile) {
+                  if (callerProfile.role != #ashaWorker) {
+                    Runtime.trap("Unauthorized: Only ASHA workers can resolve SOS alerts");
+                  };
+                  if (not isAshaAssignedToBeneficiary(callerUserId, alert.userId)) {
+                    Runtime.trap("Unauthorized: Can only resolve SOS alerts for assigned beneficiaries");
+                  };
+                };
+                case (null) {
+                  Runtime.trap("Unauthorized: User profile not found");
+                };
+              };
+            };
+          };
+        };
+
+        let updatedAlert = { alert with status = #resolved };
+        sosAlerts.add(alertId, updatedAlert);
+      };
+    };
+  };
+
+  public query ({ caller }) func getActiveSOSAlertsByAsha(ashaId : Text) : async [SOSAlert] {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can view SOS alerts");
+    };
+
+    // ASHA workers can only view their own alerts, admins can view any
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot view SOS alerts");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != ashaId and not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Can only view your own SOS alerts");
+        };
+      };
+    };
+
+    let beneficiaries = switch (userProfiles.get(ashaId)) {
+      case (null) { [] };
+      case (?profile) {
+        if (profile.role != #ashaWorker) {
+          Runtime.trap("User is not an ASHA worker");
+        };
+        profile.beneficiaries;
+      };
+    };
+
+    sosAlerts.values().toArray().filter(func(alert) { 
+      alert.status == #active and beneficiaries.find(func(b) { b == alert.userId }) != null 
+    });
+  };
+
+  // --- ASHA Assignments ---
+  public query ({ caller }) func getAshaBeneficiaryList(ashaId : Text) : async [UserProfile] {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can view beneficiary lists");
+    };
+
+    // ASHA workers can only view their own list, admins can view any
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot view beneficiary list");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != ashaId and not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Can only view your own beneficiary list");
+        };
+      };
+    };
+
+    switch (userProfiles.get(ashaId)) {
+      case (null) { Runtime.trap("ASHA profile not found") };
+      case (?profile) {
+        if (profile.role != #ashaWorker) {
+          Runtime.trap("User is not an ASHA worker");
+        };
+
+        profile.beneficiaries.map(
+          func(beneficiaryId) {
+            switch (userProfiles.get(beneficiaryId)) {
+              case (null) { Runtime.trap("Beneficiary not found") };
+              case (?beneficiary) { beneficiary };
+            };
+          }
+        );
+      };
+    };
+  };
+
+  // --- Notifications ---
+  public shared ({ caller }) func createNotification(userId : Text, message : Text, alertType : { #missedCheckIn; #riskStatusChange; #sosEvent }) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can create notifications");
+    };
+
+    // Only admins or ASHA workers can create notifications for their beneficiaries
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot create notifications");
+        };
+      };
+      case (?callerUserId) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          switch (userProfiles.get(callerUserId)) {
+            case (?callerProfile) {
+              if (callerProfile.role != #ashaWorker) {
+                Runtime.trap("Unauthorized: Only ASHA workers can create notifications");
+              };
+              if (not isAshaAssignedToBeneficiary(callerUserId, userId)) {
+                Runtime.trap("Unauthorized: Can only create notifications for assigned beneficiaries");
+              };
+            };
+            case (null) {
+              Runtime.trap("Unauthorized: User profile not found");
+            };
+          };
+        };
+      };
+    };
+
+    let notification : Notification = {
+      id = nextNotificationId;
+      userId;
+      message;
+      isRead = false;
+      timestamp = Time.now();
+      alertType;
+    };
+
+    notifications.add(nextNotificationId, notification);
+    nextNotificationId += 1;
+  };
+
+  public shared ({ caller }) func markNotificationAsRead(notificationId : Nat) : async () {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can mark notifications as read");
+    };
+
+    switch (notifications.get(notificationId)) {
+      case (null) { Runtime.trap("Notification not found") };
+      case (?notification) {
+        // Users can only mark their own notifications as read
+        switch (getCallerUserId(caller)) {
+          case (null) {
+            if (not AccessControl.isAdmin(accessControlState, caller)) {
+              Runtime.trap("Unauthorized: Cannot mark notification as read");
+            };
+          };
+          case (?callerUserId) {
+            if (callerUserId != notification.userId and not AccessControl.isAdmin(accessControlState, caller)) {
+              Runtime.trap("Unauthorized: Can only mark your own notifications as read");
+            };
+          };
+        };
+
+        let updatedNotification = { notification with isRead = true };
+        notifications.add(notificationId, updatedNotification);
+      };
+    };
+  };
+
+  public query ({ caller }) func getNotificationsForUser(userId : Text) : async [Notification] {
+    if (not AccessControl.hasPermission(accessControlState, caller, #user)) {
+      Runtime.trap("Unauthorized: Only authenticated users can view notifications");
+    };
+
+    // Users can only view their own notifications
+    switch (getCallerUserId(caller)) {
+      case (null) {
+        if (not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Cannot view notifications");
+        };
+      };
+      case (?callerUserId) {
+        if (callerUserId != userId and not AccessControl.isAdmin(accessControlState, caller)) {
+          Runtime.trap("Unauthorized: Can only view your own notifications");
+        };
+      };
+    };
+
+    notifications.values().toArray().filter(func(n) { n.userId == userId });
+  };
+
+  // --- Nutrition Tips ---
+  public shared ({ caller }) func addNutritionTip(tip : NutritionTip) : async () {
+    if (not AccessControl.isAdmin(accessControlState, caller)) {
+      Runtime.trap("Unauthorized: Only admins can add nutrition tips");
+    };
+
+    nutritionTips.add(tip);
+  };
+
+  public query ({ caller }) func getNutritionTips() : async [NutritionTip] {
+    // Anyone can retrieve nutrition tips (including guests)
+    nutritionTips.toArray();
+  };
+};
