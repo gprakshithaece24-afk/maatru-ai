@@ -1,0 +1,49 @@
+MAATRU AI
+
+## Current State
+- Three login roles: Pregnant Woman, ASHA Worker
+- Woman dashboard with voice assistant (Web Speech API), health log, pregnancy tracker, nutrition tips, SOS button
+- ASHA worker dashboard with beneficiary list and risk color coding
+- Three-language support (English, Hindi, Kannada) across all pages via LanguageContext
+- Login flow: phone → OTP → role selection
+
+## Requested Changes (Diff)
+
+### Add
+- Third role option "Family Member" (👨‍👩‍👧) on the role selection screen in LoginPage
+- Family Member stored role key: familyMember in localStorage
+- New route /dashboard/family 
+- New page FamilyMemberDashboard.tsx with:
+  - Header with language switcher and logout
+  - Patient relation input (dropdown: Husband, Mother, Mother-in-law, Sister, Brother, Other)
+  - Patient problem description textarea ("What problem is the patient facing?")
+  - Patient name field
+  - Call ASHA Worker button (large, prominent, shows a confirmation dialog with ASHA worker contact info)
+  - Status display showing patient's last known status (mock: green/yellow/red)
+  - Emergency SOS button
+- New translations for family member role in login.ts (en/hi/kn)
+- New translations file for family dashboard (family.ts) in en/hi/kn
+- Route guard redirect: if storedRole === "familyMember" → /dashboard/family
+
+### Modify
+- LoginPage.tsx: Add family member option to role selection grid (3 cards instead of 2); add redirect for familyMember role; update handleRoleSelect to handle "family" role
+- App.tsx: Add familyDashboardRoute for /dashboard/family
+- login.ts: Add family member role translations in all 3 languages
+- WomanDashboard.tsx: Fix voice assistant — add permission request handling, fix lang code to support English (en-US) and Kannada (kn-IN) alongside Hindi (hi-IN) based on current selected language
+
+### Remove
+- Nothing removed
+
+## Implementation Plan
+1. Update login.ts translations to add family member role strings (all 3 languages)
+2. Create src/frontend/src/translations/family.ts with full en/hi/kn translations for family dashboard
+3. Create src/frontend/src/pages/FamilyMemberDashboard.tsx with all the required UI sections
+4. Update LoginPage.tsx: add "family" to SelectedRole type, add family member button in role step, add redirect logic for familyMember stored role, handle role select for "family"
+5. Update App.tsx: import FamilyMemberDashboard, add familyDashboardRoute
+6. Fix WomanDashboard.tsx voice assistant: map language context to correct BCP-47 lang code (en → en-IN, hi → hi-IN, kn → kn-IN), add microphone permission error handling with user-friendly message
+
+## UX Notes
+- Family member card: blue/indigo color theme to differentiate from rose (woman) and green (asha)
+- Family dashboard: simple, clear layout — large touch targets, minimal jargon
+- Call ASHA Worker button: prominent, orange/amber color, opens a dialog showing ASHA contact details and a "Call Now" link (tel: link)
+- Voice fix: language code must match user's selected language so speech recognition works in the right language; show a clear "Microphone permission denied" toast if permission is blocked
